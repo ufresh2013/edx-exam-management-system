@@ -7,6 +7,8 @@ from collections import OrderedDict
 from django.db import transaction
 from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
+import pytz
+from django.conf import settings
 from rest_framework import filters, status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
@@ -39,6 +41,8 @@ from exam_paper.models import (
     ExamParticipantAnswer,
     PAPER_CREATE_TYPE,
     TASK_STATE,
+    EXAM_RESULT,
+    PROBLEM_TYPE
 )
 from exam_paper.utils import response_format
 
@@ -145,7 +149,6 @@ class MyExamViewSet(RetrieveModelMixin, ListModelMixin, CreateModelMixin, Generi
         state_count = {
             'started': 0,
             'finished': 0,
-            'unavailable': 0,
             'pending': 0,
             'all_count': 0,
             'current_time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -153,7 +156,6 @@ class MyExamViewSet(RetrieveModelMixin, ListModelMixin, CreateModelMixin, Generi
         state_count.update(queryset_state_update.filter(task_state=TASK_STATE[0][0]).aggregate(pending=Count('pk')))
         state_count.update(queryset_state_update.filter(task_state=TASK_STATE[1][0]).aggregate(started=Count('pk')))
         state_count.update(queryset_state_update.filter(task_state=TASK_STATE[2][0]).aggregate(finished=Count('pk')))
-        state_count.update(queryset_state_update.filter(task_state=TASK_STATE[3][0]).aggregate(unavailable=Count('pk')))
         state_count.update(queryset_state_update.filter().aggregate(all_count=Count('pk')))
         # queryset_state_update
         if request.GET.get('ordering') is None and request.GET.get('task_state') is None:
@@ -258,12 +260,12 @@ class ExamParticipantAnswerViewSet(RetrieveModelMixin, ListModelMixin,
     ```
     """
 
-    # authentication_classes = (
-    #     SessionAuthentication,
-    # )
-    # permission_classes = (
-    #     IsAuthenticated,
-    # )
+    authentication_classes = (
+        SessionAuthentication,
+    )
+    permission_classes = (
+        IsAuthenticated,
+    )
     serializer_class = ExamParticipantAnswerSerializer
 
     def get_queryset(self):
@@ -281,6 +283,38 @@ class ExamParticipantAnswerViewSet(RetrieveModelMixin, ListModelMixin,
                 return ExamParticipantAnswer.objects.filter(id=pk)
             except Exception as ex:
                 return []
+
+    def create(self, request, *args, **kwargs):
+        """
+        提交试卷
+        :param request:
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        participant_id = str(self.request.data['participant_id'])
+        exam_participant = ExamParticipant.objects.filter(id=participant_id).first()
+        if not exam_participant:
+            return Response(response_format(data=[], msg='考试不存在', status=-1))
+        if exam_participant.task_state == TASK_STATE[1][0]:
+            problems = ExamParticipantAnswerSerializer(request.data['problems'])
+            exam_participant_answers = ExamParticipantAnswer.objects.filter()
+            total_grade = 0
+            with transaction.atomic():
+                for problem in problems.instance:
+                    exam_participant_answer = exam_participant_answers.filter(id=str(problem['id'])).first()
+                    if exam_participant_answer:
+                        exam_participant_answer.answer = str(problem['answer'])
+                        # 计算分数
+                        exam_participant_answer.grade = self.calculating_score(exam_participant_answer)
+                        total_grade += exam_participant_answer.grade
+                        exam_participant_answer.save()
+                exam_participant.task_state = TASK_STATE[2][0]
+                exam_participant.exam_result = self.get_exam_reuslt(exam_participant, total_grade)
+                exam_participant.save()
+        else:
+            return Response(response_format(data=[], msg='只有考试中的试卷允许提交'))
+        return Response(response_format(data=[], msg='提交成功'))
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -353,12 +387,31 @@ class ExamParticipantAnswerViewSet(RetrieveModelMixin, ListModelMixin,
         common_info = {
             'participant_id': exam_participant.id,
             'task_state': exam_participant.task_state,
+            'user_name': exam_participant.participant.username or '',
             'current_time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'exam_task': serializer.data
+            'exam_task': serializer.data,
+            'participate_time': exam_participant.participate_time.replace(tzinfo=pytz.utc).astimezone(
+                pytz.timezone(settings.TIME_ZONE)).strftime('%Y-%m-%d %H:%M:%S')
         }
         if exam_participant.task_state == TASK_STATE[2][0]:
             common_info['total_grade'] = exam_participant.total_grade
+            common_info['exam_result'] = exam_participant.exam_result
         return common_info
+
+    def get_exam_reuslt(self, exam_participant, total_grade):
+        """
+        获得考试是否通过
+        :param exam_participant:
+        :param total_grade:
+        :return:
+        """
+        exam_task = exam_participant.exam_task
+        passing_ratio_grade = (exam_task.exampaper_total_grade * exam_task.exampaper_passing_ratio) / 100
+
+        if passing_ratio_grade > total_grade:
+            return EXAM_RESULT[1][0]
+        else:
+            return EXAM_RESULT[0][0]
 
     def get_return_response(self, data, **kwargs):
         """
@@ -398,45 +451,47 @@ class ExamParticipantAnswerViewSet(RetrieveModelMixin, ListModelMixin,
         """
         return serializer.data
 
+    def calculating_score(self, exam_participant_answer):
+        """
+        计算每道题的得分 是否正确
+        :param exam_participant_answer:
+        :return:
+        """
+        grade = 0
+        judgement_answer = JudgmentAnswer(exam_participant_answer.content['answers'], exam_participant_answer.answer)
+        if exam_participant_answer.problem_type == PROBLEM_TYPE[0][0]:
+            flag = judgement_answer.judgment_single_choice()
+        elif exam_participant_answer.problem_type == PROBLEM_TYPE[1][0]:
+            flag = judgement_answer.judgment_multichoice()
+        elif exam_participant_answer.problem_type == PROBLEM_TYPE[2][0]:
+            flag = judgement_answer.judgment_fill_in()
+        else:
+            flag = False
+        if flag:
+            grade = exam_participant_answer.problem_grade
+
+        return grade
+
 
 class JudgmentAnswer(object):
     """
     判断答案是否正确
     """
-    PROBLEM_TYPE = (
-        ('multiplechoiceresponse', 'single_choice'),
-        ('choiceresponse', 'multi_choice'),
-        ('stringresponse', 'fill_in'),
-    )
-    AnswerDict = {
-        'A': 0,
-        'B': 1,
-        'C': 2,
-        'D': 3,
-        'E': 4,
-        'F': 5,
-        'G': 6,
-        'H': 7,
-        'I': 8,
-        'a': 0,
-        'b': 1,
-        'c': 2,
-        'd': 3,
-        'e': 4,
-        'f': 5,
-        'g': 6,
-        'h': 7,
-        'i': 8,
 
-    }
-    context = ""
-    answer = ""
+    right_answer = ""
+    user_answer = ""
 
-    def __init__(self, context, answer):
-        self.context = context
-        self.answer = answer
+    def __init__(self, right_answer, user_answer):
+        """
+        init
+        :param right_answer: 正确答案
+        :param user_answer: 用户答案
+        :return:
+        """
+        self.right_answer = right_answer
+        self.user_answer = user_answer
 
-    def JudgmentSingleChoice(self):
+    def judgment_single_choice(self):
         """
         判断单选题
         {
@@ -456,14 +511,15 @@ class JudgmentAnswer(object):
         :return:
         """
         try:
-            if self.AnswerDict[self.answer] == self.StringToDict()['answers']:
+            format_answer = "[{}]".format(self.user_answer)
+            if str(format_answer) == str(self.right_answer):
                 return True
             else:
                 return False
         except Exception as ex:
             return False
 
-    def JudgmentMultiChoice(self):
+    def judgment_multichoice(self):
         """
         判断多选题
         {
@@ -488,18 +544,15 @@ class JudgmentAnswer(object):
         :return:
         """
         try:
-            answers = self.answer.split(',')
-            answers_list = []
-            for c in answers:
-                answers_list.append(self.AnswerDict[c])
-            if answers_list == self.StringToDict()['answers']:
+            format_answer = "[{}]".format(self.user_answer)
+            if str(format_answer) == str(self.right_answer):
                 return True
             else:
                 return False
         except Exception as ex:
             return False
 
-    def JudgmentFillIn(self):
+    def judgment_fill_in(self):
         """
         判断填空题 stringresponse
         {
@@ -514,22 +567,22 @@ class JudgmentAnswer(object):
         :return:
         """
         try:
-            if self.answer in self.StringToDict()['answers']:
+            if str(self.user_answer) in self.right_answer:
                 return True
             else:
                 return False
         except Exception as ex:
             return False
 
-    def StringToDict(self):
-        """
-        解析字符串
-            -descriptions:{}
-            -options:["87.5%","65%","35%","25%"],
-            -solution:【解析】产出率=可用的65万部÷总数100万部。根据“该公司原计划投入800工时进行加工生产，实际上只用了700工时”得出的87.5%，是公司的实际产能利用率，不是产出率。
-            -answers:1
-            -title:产出率=可用的65万部÷总数100万部。根据“该公司原计划投入800工时进行加工生产，实际上只用了700工时”得出的87.5%，是公司的实际产能利用率，不是产出率。
-        :return:
-        """
-        dictinfo = json.loads(self.context)
-        return dictinfo
+    # def StringToDict(self):
+    #     """
+    #     解析字符串
+    #         -descriptions:{}
+    #         -options:["87.5%","65%","35%","25%"],
+    #         -solution:【解析】产出率=可用的65万部÷总数100万部。根据“该公司原计划投入800工时进行加工生产，实际上只用了700工时”得出的87.5%，是公司的实际产能利用率，不是产出率。
+    #         -answers:1
+    #         -title:产出率=可用的65万部÷总数100万部。根据“该公司原计划投入800工时进行加工生产，实际上只用了700工时”得出的87.5%，是公司的实际产能利用率，不是产出率。
+    #     :return:
+    #     """
+    #     dictinfo = json.loads(self.context)
+    #     return dictinfo
